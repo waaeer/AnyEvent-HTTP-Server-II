@@ -32,7 +32,7 @@ use AnyEvent::HTTP::Server::WS;
 use Time::HiRes qw/gettimeofday/;
 use MIME::Base64 qw(encode_base64);
 use Scalar::Util qw(weaken);
-use Digest::SHA1 'sha1';
+use Digest::SHA 'sha1';
 
 	our @hdr = map { lc $_ }
 	our @hdrn  = qw(
