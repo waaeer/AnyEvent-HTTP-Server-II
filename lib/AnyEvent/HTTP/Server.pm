@@ -6,7 +6,7 @@ AnyEvent::HTTP::Server - AnyEvent HTTP/1.1 Server
 
 =cut
 
-our $VERSION = '1.9995';
+our $VERSION = '1.9996';
 
 #use common::sense;
 #use 5.008008;
@@ -22,6 +22,7 @@ use AnyEvent::HTTP::Server::Kit;
 
 use AnyEvent;
 use AnyEvent::Socket;
+use AnyEvent::Handle;
 use Scalar::Util 'refaddr', 'weaken';
 use Errno qw(EAGAIN EINTR);
 use AnyEvent::Util qw(WSAEWOULDBLOCK guard AF_INET6 fh_nonblocking);
@@ -139,7 +140,7 @@ sub listen:method {
 		}
 		
 		bind $fh, AnyEvent::Socket::pack_sockaddr( $service, $ipn )
-			or Carp::croak "listen/bind on ".Socket::inet_ntoa($ipn).":$service: $!";
+			or Carp::croak "listen/bind on ".eval{Socket::inet_ntoa($ipn)}.":$service: $!";
 		
 		if ($host eq 'unix/') {
 			chmod oct('0777'), $service
@@ -422,6 +423,8 @@ sub incoming {
 													( $idx + length($bnd) + 1 <= length($body) and substr($body,$idx+length($bnd),1) eq "\012" )
 													or
 													( $idx + length($bnd) + 2 <= length($body) and substr($body,$idx+length($bnd),2) eq "\015\012" )
+													or
+													( $idx + length($bnd) + 2 <= length($body) and substr($body,$idx+length($bnd),2) eq "\055\055" )
 												) ) {
 													#warn "have part";
 													my $part = substr($body,$idx-2,1) eq "\015" ? substr($body,0,$idx-2) : substr($body,0,$idx-1);
@@ -533,6 +536,7 @@ sub incoming {
 												$self->drop($id) if $self;
 											}
 										};
+										weaken($req->[11] = $h);
 										$rv[1]->($h);
 										weaken($req);
 										%r = ( );
