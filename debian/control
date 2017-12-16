@@ -1,0 +1,14 @@
+Source: libanyevent-http-server-ii-perl
+Section: perl
+Priority: optional
+Maintainer: Ivan Panchenko <wao@mail.ru>
+Build-Depends: debhelper (>= 9)
+Build-Depends-Indep: perl
+Standards-Version: 3.9.8
+Homepage: https://github.com/Mons/AnyEvent-HTTP-Server-II
+
+Package: libanyevent-http-server-ii-perl
+Architecture: all
+Depends: ${misc:Depends}, ${perl:Depends}, libev-perl
+Description: Asynchronous event driven perl HTTP server.
+
