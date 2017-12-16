@@ -67,6 +67,7 @@ use Digest::SHA 'sha1';
 			TIME      => 9,
 			CTX       => 10,
 			HANDLE    => 11,
+			ATTRS     => 12,
 		};
 		
 		sub connection { $_[0][2]{connection} =~ /^([^;]+)/ && lc( $1 ) }
@@ -75,8 +76,21 @@ use Digest::SHA 'sha1';
 		sub full_uri { 'http://' . $_[0][2]{host} . $_[0][1] }
 		sub uri     { $_[0][1] }
 		sub headers { $_[0][2] }
+		sub attrs   { $_[0][ATTRS] //= {} }
+		sub server  { $_[0][SERVER] }
+
+		sub replied {
+			my $r = shift;
+			if (@_) {
+				$r->attrs->{replied} = shift;
+			}
+			else {
+				$r->attrs->{replied};
+			}
+		}
 		
 		sub url_unescape($) {
+			# return undef unless defined $_[0];
 			my $string = shift;
 			$string =~ s/\+/ /sg;
 			#return $string if index($string, '%') == -1;
@@ -118,6 +132,7 @@ use Digest::SHA 'sha1';
 					)
 				$ }xso
 			];
+			# $_[0][5][2] = url_unescape( $_[0][5][2] );
 			$_[0][6] = +{ map { my ($k,$v) = split /=/,$_,2; +( url_unescape($k) => url_unescape($v) ) } split /&/, $_[0][5][3] };
 		}
 		
@@ -145,6 +160,7 @@ use Digest::SHA 'sha1';
 				return keys %{ $_[0][6] };
 			}
 		}
+		our $CALLDEPTH = 1;
 		
 		sub replyjs {
 			my $self = shift;
@@ -183,6 +199,7 @@ use Digest::SHA 'sha1';
 			$jdata =~ s{<}{\\u003c}sg;
 			$jdata =~ s{>}{\\u003e}sg;
 			$jdata = "$callback_name( $jdata );" if $callback_name;
+			local $CALLDEPTH = $CALLDEPTH + 1;
 			$self->reply( $code, $jdata, %args );
 			
 		}
@@ -191,6 +208,14 @@ use Digest::SHA 'sha1';
 			my $self = shift;
 			my ( $code,$file,%args ) = @_;
 			$code ||=200;
+
+			if ($self->replied) {
+				warn "Double reply $code from ".join(":", (caller $CALLDEPTH)[1,2])." prev was from ".$self->replied."\n";
+				exit 255 if $self->server->{exit_on_double_reply};
+				return;
+			}
+			$self->replied(join ":", (caller $CALLDEPTH)[1,2]);
+
 			my $reply = "HTTP/1.0 $code $http{$code}$LF";
 			my $size = -s $file or $! and return warn "Can't sendfile `$file': $!";
 			open my $f, '<:raw',$file or return  warn "Can't open file `$file': $!";
@@ -235,6 +260,7 @@ use Digest::SHA 'sha1';
 			my $location = shift;
 			my %args = @_;
 			( $args{headers} ||= {} )->{location} = $location;
+			local $CALLDEPTH = $CALLDEPTH + 1;
 			$self->reply( 302, "Moved", %args );
 		}
 		
@@ -262,8 +288,28 @@ use Digest::SHA 'sha1';
 				%{ $args{headers} || {} },
 				#'connection' => 'close',
 				'connection' => ( $args{headers} && $args{headers}{connection} ) ? $args{headers}{connection} : $self->connection,
-				'content-length' => length($content),
 			};
+			if ($self->method ne 'HEAD') {
+				if ( exists $h->{'content-length'} ) {
+					if ($h->{'content-length'} != length($content)) {
+						warn "Content-Length mismatch: replied: $h->{'content-length'}, expected: ".length($content);
+						$h->{'content-length'} = length($content);
+					}
+				} else {
+					$h->{'content-length'} = length($content);
+				}
+			} else {
+				if ( exists $h->{'content-length'} ) {
+					# keep it
+				}
+				elsif(length $content) {
+					$h->{'content-length'} = length $content;
+				}
+				else {
+					$h->{'transfer-encoding'} = 'chunked';
+				}
+				$content = '';
+			}
 			if (exists $h->{'content-type'}) {
 				if( $h->{'content-type'} !~ m{[^;]+;\s*charset\s*=}
 				and $h->{'content-type'} =~ m{(?:^(?:text/|application/(?:json|(?:x-)?javascript))|\+(?:json|xml)\b)}i) {
@@ -278,6 +324,9 @@ use Digest::SHA 'sha1';
 				else { push @bad, "\u\L$_\E: ".$h->{$_}.$LF; }
 			}
 			defined() and $reply .= $_ for @good,@bad;
+			# 2 is size of LF
+			$self->attrs->{head_size} = length($reply) + 2;
+			$self->attrs->{body_size} = length $content;
 			$reply .= $LF.$content;
 			#if (!ref $content) { $reply .= $content }
 			if( $self->[3] ) {
@@ -299,6 +348,14 @@ use Digest::SHA 'sha1';
 				#	warn "on_reply died with $@";
 				#};
 			};
+
+			if ($self->replied) {
+				warn "Double reply $code from ".join(":", (caller $CALLDEPTH)[1,2])." prev was from ".$self->replied."\n";
+				exit 255 if $self->server->{exit_on_double_reply};
+				return;
+			}
+			$self->replied(join ":", (caller $CALLDEPTH)[1,2]);
+
 			if( $self->[8] && $self->[8]->{stat_cb} ) {
 				eval {
 					$self->[8]->{stat_cb}->($self->path, $self->method, gettimeofday() - $self->[9]);
@@ -360,9 +417,23 @@ use Digest::SHA 'sha1';
 			}
 		}
 		
+		sub send_100_continue {
+			my ($self,$code,%args) = @_;
+			my $reply = "HTTP/1.1 100 $http{100}$LF$LF";
+			$self->[3]->( \$reply );
+		}
+
 		sub send_headers {
 			my ($self,$code,%args) = @_;
 			$code ||= 200;
+
+			if ($self->replied) {
+				warn "Double reply $code from ".join(":", (caller $CALLDEPTH)[1,2])." prev was from ".$self->replied."\n";
+				exit 255 if $self->server->{exit_on_double_reply};
+				return;
+			}
+			$self->replied(join ":", (caller $CALLDEPTH)[1,2]);
+
 			my $reply = "HTTP/1.1 $code $http{$code}$LF";
 			my @good;my @bad;
 			my $h = {
@@ -374,6 +445,8 @@ use Digest::SHA 'sha1';
 			if (!exists $h->{'content-length'} and !exists $h->{upgrade}) {
 				$h->{'transfer-encoding'} = 'chunked';
 				$self->[4]= 1;
+			} else {
+				$self->[4]= 0;
 			}
 			for (keys %$h) {
 				if (exists $hdr{lc $_}) { $good[ $hdri{lc $_} ] = $hdr{ lc $_ }.": ".$h->{$_}.$LF; }
@@ -381,8 +454,17 @@ use Digest::SHA 'sha1';
 			}
 			defined() and $reply .= $_ for @good,@bad;
 			$reply .= $LF;
+			$h->{Status} = $code;
+			$self->attrs->{sent_headers} = $h;
+			$self->attrs->{head_size} = length $reply;
+			$self->attrs->{body_size} = 0;
 			#warn "send headers: $reply";
 			$self->[3]->( \$reply );
+			if (!$self->[4]) {
+				if ($args{clearance}) {
+					$self->[3] = undef;
+				}
+			}
 		}
 		
 		sub body {
@@ -390,6 +472,7 @@ use Digest::SHA 'sha1';
 			$self->[4] or die "Need to be chunked reply";
 			my $content = shift;
 			utf8::encode $content if utf8::is_utf8 $content;
+			$self->attrs->{body_size} += length $content;
 			my $length = sprintf "%x", length $content;
 			#warn "send body part $length / ".length($content)."\n";
 			$self->[3]->( \("$length$LF$content$LF") );
@@ -397,24 +480,62 @@ use Digest::SHA 'sha1';
 		
 		sub finish {
 			my $self = shift;
-			$self->[4] or die "Need to be chunked reply";
-			#warn "send body end (".$self->connection.")\n";
-			if( $self->[3] ) {
-				$self->[3]->( \("0$LF$LF")  );
-				$self->[3]->(\undef) if $self->connection eq 'close' or $self->[SERVER]{graceful};
-				delete $self->[3];
-				${ $self->[REQCOUNT] }--;
+			if ($self->[4]) {
+				#warn "send body end (".$self->connection.")\n";
+				if( $self->[3] ) {
+					$self->[3]->( \("0$LF$LF")  );
+					$self->[3]->(\undef) if $self->connection eq 'close' or $self->[SERVER]{graceful};
+					delete $self->[3];
+				}
+				undef $self->[4];
+			}
+			elsif(defined $self->[4]) {
+				undef $self->[4];
+			}
+			else {
+				die "Need to be chunked reply";
+			}
+			${ $self->[REQCOUNT] }--;
+			if ( $self->attrs->{sent_headers} ) {
+				my $h = delete $self->attrs->{sent_headers};
+				if( $self->[8] && $self->[8]->{on_reply} ) {
+					$h->{ResponseTime} = gettimeofday() - $self->[9];
+					$self->[8]->{on_reply}->(
+						$self,
+						$h,
+					);
+				};
 			}
 		}
 
 		sub abort {
 			my $self = shift;
-			$self->[4] or die "Need to be chunked reply";
-			if( $self->[3] ) {
-				$self->[3]->( \("1$LF"));
-				$self->[3]->( \undef);
-				delete $self->[3];
-				${ $self->[REQCOUNT] }--;
+			if( $self->[4] ) {
+				if( $self->[3] ) {
+					$self->[3]->( \("1$LF"));
+					$self->[3]->( \undef);
+					delete $self->[3];
+				}
+				undef $self->[4];
+			}
+			elsif (defined $self->[4]) {
+				undef $self->[4];
+			}
+			else {
+				die "Need to be chunked reply";
+			}
+			${ $self->[REQCOUNT] }--;
+			if ( $self->attrs->{sent_headers} ) {
+				my $h = delete $self->attrs->{sent_headers};
+				if( $self->[8] && $self->[8]->{on_reply} ) {
+					$h->{ResponseTime} = gettimeofday() - $self->[9];
+					$h->{SentStatus} = $h->{Status};
+					$h->{Status} = "590";
+					$self->[8]->{on_reply}->(
+						$self,
+						$h,
+					);
+				};
 			}
 		}
 		
@@ -423,6 +544,7 @@ use Digest::SHA 'sha1';
 			my $caller = "@{[ (caller)[1,2] ]}";
 			#warn "Destroy req $self->[0] $self->[1] by $caller";
 			if( $self->[3] ) {
+				local $@;
 				eval {
 					if ($self->[4]) {
 						$self->abort();
@@ -442,7 +564,11 @@ use Digest::SHA 'sha1';
 						warn "[E] Died in request DESTROY: $@ from $caller\n";
 					}
 				};
-			};
+			}
+			elsif (defined $self->[4]) {
+				warn "[E] finish or abort was not called for ".( $self->[4] ? "chunked" : "partial" )." response";
+				$self->abort;
+			}
 			@$self = ();
 		}
 
