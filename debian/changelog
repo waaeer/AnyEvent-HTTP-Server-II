@@ -1,3 +1,9 @@
+libanyevent-http-server-ii-perl (1.99981-1) unstable; urgency=medium
+
+  * Fixed cookie parsing: first cookie was missed
+
+ -- Ivan Panchenko <wao@mail.ru>  Tue, 22 Sep 2020 15:06:00 +0300
+
 libanyevent-http-server-ii-perl (1.9998-1) unstable; urgency=medium
 
   * First deb package built
