@@ -838,8 +838,8 @@ to true, or request processing will be aborted by AnyEvent:HTTP::Server.
 
 One able to process POST requests by returning specially crafted  hash reference from cb 
 parameter coderef ($dispatcher in out example). This hash must contain the B<form> key, 
-holding a code reference. If B<conetnt-encoding> header is 
-B<application/x-www-form-urlencoded>, form callback will be called.
+holding a code reference. If such key exists, this code reference will be called with two arguments,
+parsed x-www-form-urlencoded POST content and same not parsed.
 
   my $post_action = sub {
     my ( $request, $form ) = @_;
@@ -853,10 +853,12 @@ B<application/x-www-form-urlencoded>, form callback will be called.
   my $dispatcher = sub {
     my $request = shift;
 
-    if ( $request->headers->{'content-type'} =~ m{^application/x-www-form-urlencoded\s*$} ) {
+    if ( $request->headers->{'content-type'} =~ m{^application/(json|x-www-form-urlencoded)\s*$} ) {
       return {
         form => sub {
-          $cb->( $request, $post_action);
+		  my ($args, $post_content_plain);
+  #         ...
+            $request->reply($status, $content, headers => $headers);
         },
       };
     } else {
