@@ -6,19 +6,12 @@ AnyEvent::HTTP::Server - AnyEvent HTTP/1.1 Server
 
 =cut
 
-our $VERSION = '1.99981';
+our $VERSION;
+BEGIN{
+$VERSION = '1.99998';
+}
 
-#use common::sense;
-#use 5.008008;
-#use strict;
-#use warnings;
-#no  warnings 'uninitialized';
-#use mro 'c3';
 use AnyEvent::HTTP::Server::Kit;
-
-#use Exporter;
-#our @ISA = qw(Exporter);
-#our @EXPORT_OK = our @EXPORT = qw(http_server);
 
 use AnyEvent;
 use AnyEvent::Socket;
@@ -28,12 +21,11 @@ use Errno qw(EAGAIN EINTR);
 use AnyEvent::Util qw(WSAEWOULDBLOCK guard AF_INET6 fh_nonblocking);
 use Socket qw(AF_INET AF_UNIX SOCK_STREAM SOCK_DGRAM SOL_SOCKET SO_REUSEADDR IPPROTO_TCP TCP_NODELAY);
 
+use Carp ();
 use Encode ();
 use Compress::Zlib ();
 use MIME::Base64 ();
 use Time::HiRes qw/gettimeofday/;
-
-#use Carp 'croak';
 
 use AnyEvent::HTTP::Server::Req;
 
@@ -52,22 +44,38 @@ my $ico_pk = pack "H*",
 	"1d8c7e040000";
 our $ico = Compress::Zlib::memGunzip $ico_pk;
 
+our $ERROR_TEMPLATE = <<"EOD";
+<html>
+<head><title>%1\$s %2\$s</title></head>
+<body bgcolor="white">
+<center><h1>%1\$s %2\$s</h1></center>
+<hr><center>${\__PACKAGE__}/$VERSION</center>
+</body>
+</html>
+EOD
+
 sub start { croak "It's a new version of ".__PACKAGE__.". For old version use `legacy' branch, or better make some minor patches to support new version" };
 sub stop  { croak "It's a new version of ".__PACKAGE__.". For old version use `legacy' branch, or better make some minor patches to support new version" };
-
 
 sub new {
 	my $pkg = shift;
 	my $self = bless {
 		backlog   => 1024,
-		read_size => 4096,
+		read_size => MAX_READ_SIZE,
 		max_header_size => MAX_READ_SIZE,
+		request   => 'AnyEvent::HTTP::Server::Req',
+		sockets => {},
 		@_,
-		active_connections => 0,
-		total_connections => 0,
 		active_requests => 0,
-		total_requests => 0,
+		active_connections => 0,
 	}, $pkg;
+	
+	if ($self->{max_header_size} > $self->{read_size}) {
+		Carp::croak "max_header_size can't be greater than read_size";
+	}
+
+	eval qq{ use $self->{request}; 1}
+		or die "Request $self->{request} not loaded: $@";
 	
 	if (exists $self->{listen}) {
 		$self->{listen} = [ $self->{listen} ] unless ref $self->{listen};
@@ -90,12 +98,17 @@ sub new {
 	$self->can("handle_request")
 		and croak "It's a new version of ".__PACKAGE__.". For old version use `legacy' branch, or better make some minor patches to support new version";
 	
-	$self->set_favicon( exists $self->{favicon} ? do {
-		open my $f, '<:raw', $self->{favicon} or die "Can't open favicon: $!";
-		local $/;
-		<$f>;
-	} : $ico ) if !exists $self->{favicon} or $self->{favicon};
-	$self->{request} = 'AnyEvent::HTTP::Server::Req';
+	if (!exists $self->{favicon}) {
+		$self->{favicon} = \$ico;
+	};
+	if ($self->{favicon} and !ref $self->{favicon}) {
+		$self->{favicon} = \do {
+			open my $f, '<:raw', $self->{favicon} or die "Can't open favicon: $!";
+			local $/;
+			<$f>;
+		};
+	}
+	$self->set_favicon( ${ $self->{favicon} } );
 	
 	return $self;
 }
@@ -108,55 +121,71 @@ sub DESTROY { $_[0]->destroy };
 sub set_favicon {
 	my $self = shift;
 	my $icondata = shift;
-	$self->{ico} = "HTTP/1.1 200 OK${LF}Connection:close${LF}Content-Type:image/x-icon${LF}Content-Length:".length($icondata)."${LF}${LF}".$icondata;
+	if ($icondata) {
+		$self->{ico} = "HTTP/1.1 200 OK${LF}Connection:close${LF}Content-Type:image/x-icon${LF}Content-Length:".length($icondata)."${LF}${LF}".$icondata;
+	}
+	else {
+		delete $self->{ico};
+	}
 }
 
 sub listen:method {
 	my $self = shift;
 	
 	for my $listen (@{ $self->{listen} }) {
-		my ($host,$service) = split ':',$listen,2;
-		$service = $self->{port} unless length $service;
-		$host = $self->{host} unless length $host;
-		$host = $AnyEvent::PROTOCOL{ipv4} < $AnyEvent::PROTOCOL{ipv6} && AF_INET6 ? "::" : "0" unless length $host;
-		
-		my $ipn = parse_address $host
-			or Carp::croak "$self.listen: cannot parse '$host' as host address";
-		
-		my $af = address_family $ipn;
-		
-		# win32 perl is too stupid to get this right :/
-		Carp::croak "listen/socket: address family not supported"
-			if AnyEvent::WIN32 && $af == AF_UNIX;
-		
-		socket my $fh, $af, SOCK_STREAM, 0 or Carp::croak "listen/socket: $!";
-		
-		if ($af == AF_INET || $af == AF_INET6) {
-			setsockopt $fh, SOL_SOCKET, SO_REUSEADDR, 1
-				or Carp::croak "listen/so_reuseaddr: $!"
-					unless AnyEvent::WIN32; # work around windows bug
+		my $fh;
+		unless ($self->{sockets}->{$listen}) {
+			my ($host,$service) = split ':',$listen,2;
+			$service = $self->{port} unless length $service;
+			$host = $self->{host} unless length $host;
+			$host = $AnyEvent::PROTOCOL{ipv4} < $AnyEvent::PROTOCOL{ipv6} && AF_INET6 ? "::" : "0" unless length $host;
 			
-			unless ($service =~ /^\d*$/) {
-				$service = (getservbyname $service, "tcp")[2]
-					or Carp::croak "tcp_listen: $service: service unknown"
+			my $ipn = parse_address $host
+				or Carp::croak "$self.listen: cannot parse '$host' as host address";
+			
+			my $af = address_family $ipn;
+			
+			# win32 perl is too stupid to get this right :/
+			Carp::croak "listen/socket: address family not supported"
+				if AnyEvent::WIN32 && $af == AF_UNIX;
+			
+			socket $fh, $af, SOCK_STREAM, 0 or Carp::croak "listen/socket: $!";
+			
+			if ($af == AF_INET || $af == AF_INET6) {
+				setsockopt $fh, SOL_SOCKET, SO_REUSEADDR, 1
+					or Carp::croak "listen/so_reuseaddr: $!"
+						unless AnyEvent::WIN32; # work around windows bug
+				
+				unless ($service =~ /^\d*$/) {
+					$service = (getservbyname $service, "tcp")[2]
+						or Carp::croak "tcp_listen: $service: service unknown"
+				}
+			} elsif ($af == AF_UNIX) {
+				unlink $service;
 			}
-		} elsif ($af == AF_UNIX) {
-			unlink $service;
-		}
-		
-		bind $fh, AnyEvent::Socket::pack_sockaddr( $service, $ipn )
-			or Carp::croak "listen/bind on ".eval{Socket::inet_ntoa($ipn)}.":$service: $!";
-		
-		if ($host eq 'unix/') {
-			chmod oct('0777'), $service
-				or warn "chmod $service failed: $!";
+			
+			bind $fh, AnyEvent::Socket::pack_sockaddr( $service, $ipn )
+				or Carp::croak "listen/bind on ".eval{Socket::inet_ntoa($ipn)}.":$service: $!";
+			
+			if ($host eq 'unix/') {
+				chmod oct('0777'), $service
+					or warn "chmod $service failed: $!";
+			}
+		} else {
+			$fh = delete $self->{sockets}->{$listen};
 		}
 		
 		fh_nonblocking $fh, 1;
 	
 		$self->{fh} ||= $fh; # compat
 		$self->{fhs}{fileno $fh} = $fh;
+		$self->{fhs_named}{$listen} = $fh;
 	}
+	
+	for my $socket (values %{ $self->{sockets} }) {
+		close $socket;
+	}
+	$self->{sockets} = {};
 	
 	$self->prepare();
 	
@@ -205,17 +234,23 @@ sub peer_info {
 sub drop {
 	my ($self,$id,$err) = @_;
 	$err =~ s/\015//sg;
-	if ($err and $self->{debug_drop}) {
-		my $fh = $self->{$id}{fh};
-		my $remote = $fh && peer_info($fh);
-		warn "Dropping connection $id from $remote: $err  (by @{[ (caller)[1,2] ]})\n";
-	}
-	my $r = delete $self->{$id};
+	warn "Dropping connection $id: $err (by request from @{[ (caller)[1,2] ]})" if DEBUG; # or $self->{debug};
+	my $r = delete $self->{$id} or return;
 	$self->{active_connections}--;
 	%{ $r } = () if $r;
 	
-	( delete $self->{graceful} )->()
-		if $self->{graceful} and $self->{active_requests} == 0;
+	if ($self->{graceful} ) {
+		if (
+			$self->{active_requests} == 0
+			# and $self->{active_connections} == 0
+			and 0+keys %{ $self->{wss} } == 0
+		) {
+			( delete $self->{graceful} )->();
+		}
+		else {
+			warn "wait for $self->{active_requests} / @{[ 0+keys %{ $self->{wss} } ]} for graceful shutdown";
+		}
+	}
 }
 
 sub req_wbuf_len {
@@ -299,6 +334,16 @@ sub incoming {
 			}
 		};
 		
+		my $reply_error = sub {
+			# my ($code,$message) = @_;
+			$_[1] //= $AnyEvent::HTTP::Server::Req::http{$_[0]};
+			# warn "ERROR @_";
+			my $body = sprintf $ERROR_TEMPLATE, $_[0], $_[1];
+			my $reply = "HTTP/1.0 $_[0] $_[1]${LF}Connection:close${LF}Content-Type:text/html${LF}Content-Length:"
+				.length($body)."${LF}${LF}".$body."\n";
+			$write->(\$reply,\undef);
+		};
+		
 		my ($state,$seq) = (0,0);
 		my ($method,$uri,$version,$lastkey,$contstate,$bpos,$len,$pos, $req);
 		
@@ -306,12 +351,11 @@ sub incoming {
 		$r{rw} = AE::io $fh, 0, sub {
 			# warn "rw.io.$id (".(fileno $fh).") seq:$seq (ok:".($self ? 1:0).':'.(( $self && exists $self->{$id}) ? 1 : 0).")";# if DEBUG;
 			$self and exists $self->{$id} or return;
-			while ( $self and ( $len = sysread( $fh, $buf, MAX_READ_SIZE-length $buf, length $buf ) ) ) {
-				# warn "rw.io.$id.rd $len ($state)";
+			while ( $self and ( $len = sysread( $fh, $buf, $self->{read_size}-length $buf, length $buf ) ) ) {
 				if ($state == 0) {
 						AGAIN:
 						if (( my $i = index($buf,"\012", $ixx) ) > -1) {
-							if (substr($buf, $ixx, $i-$ixx) =~ /(\S+) \040 (\S+) \040 HTTP\/(\d+\.\d+)/xso) {
+							if (substr($buf, $ixx, $i - $ixx) =~ /^(\S++) \040 (\S++) \040 HTTP\/(\d++\.\d++)\015?$/xso) {
 								$method  = $1;
 								$uri     = $2;
 								$version = $3;
@@ -322,17 +366,26 @@ sub incoming {
 								$self->{active_requests}++;
 								#push @{ $r{req} }, [{}];
 							}
-							elsif(substr($buf, $ixx, $i-$ixx) =~ /^\015?$/ms) {
-								# warn "Empty line";
-								$ixx = $i+1;
-								goto AGAIN;
+							elsif (substr($buf, $ixx, $i - $ixx) =~ /^\015?$/) {
+								# warn "Skip empty line";
+								$ixx = $i + 1;
+								redo;
 							}
 							else {
-								$self->badconn($fh,\substr($buf, $ixx, $i-$ixx), "Malformed request at offset $ixx+".($i-$ixx));
-								return $self->drop($id, "Malformed request");
+								warn "Broken request ($i): <".substr($buf, $ixx, $i).">";
+								return $reply_error->(400);
+								# return $self->drop($id, "Broken request ($i): <".substr($buf, $ixx, $i).">");
 							}
 							$pos = $i+1;
 						} else {
+							if ($ixx > 0) {
+								$buf = substr($buf,$ixx);
+								$pos = $ixx = 0;
+							}
+							elsif ( length($buf) >= $self->{max_header_size} ) {
+								return $reply_error->(413);
+							}
+							warn "Need more data" if DEBUG;
 							return; # need more
 						}
 				}
@@ -344,10 +397,11 @@ sub incoming {
 					warn "Parsing headers from pos $pos:".substr($buf,$pos) if DEBUG;
 							while () {
 								#warn "parse line >'".substr( $buf,pos($buf),index( $buf, "\012", pos($buf) )-pos($buf) )."'";
+								$bpos = pos($buf);
 								if( $buf =~ /\G ([^:\000-\037\040]++)[\011\040]*+:[\011\040]*+ ([^\012\015;]*+(;)?[^\012\015]*+) \015?\012/sxogc ){
 									$lastkey = lc $1;
 									$h{ $lastkey } = exists $h{ $lastkey } ? $h{ $lastkey }.','.$2: $2;
-									#warn "Captured header $lastkey = '$2'";
+									warn "Captured header $lastkey = '$2'";
 									if ( defined $3 ) {
 										my $v = $2;
 										while ( $v =~ m{ \s* ([^\s=]++)\s*= (?: "((?:[^\\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* ;? }gcxso ) { 
@@ -366,14 +420,27 @@ sub incoming {
 								elsif ($buf =~ /\G[\011\040]+/sxogc) { # continuation
 									#warn "Continuation";
 									if (length $lastkey) {
-										$buf =~ /\G ([^\015\012;]*+(;)?[^\015\012]*+) \015?\012/sxogc or return pos($buf) = $bpos; # need more data;
+										unless ($buf =~ /\G ([^\015\012;]*+(;)?[^\015\012]*+) \015?\012/sxogc) {
+											if ($ixx > 0) {
+												$pos = $bpos - $ixx;
+												$buf = substr($buf,$ixx);
+												$ixx = 0;
+											}
+											elsif ( length($buf) >= $self->{max_header_size} ) {
+												$self->{active_requests}--;
+												return $reply_error->(413);
+											}
+											warn "Need more data" if DEBUG;
+											return; # need more
+										};
+										# $buf =~ /\G ([^\015\012;]*+(;)?[^\015\012]*+) \015?\012/sxogc or return pos($buf) = $bpos; # need more data;
 										$h{ $lastkey } .= ' '.$1;
 										if ( ( defined $2 or $contstate ) ) {
 											#warn "With ;";
 											if ( ( my $ext = index( $h{ $lastkey }, ';', rindex( $h{ $lastkey }, ',' ) + 1) ) > -1 ) {
 												# Composite field. Need to reparse last field value (from ; after last ,)
-											# full key rescan, because of possible case: <key:value; field="value\n\tvalue continuation"\n>
-											# regexp needed to set \G
+												# full key rescan, because of possible case: <key:value; field="value\n\tvalue continuation"\n>
+												# regexp needed to set \G
 												pos($h{ $lastkey }) = $ext;
 												#warn "Rescan from $ext";
 												#warn("<$1><$2><$3>"),
@@ -389,22 +456,23 @@ sub incoming {
 									last;
 								}
 								elsif($buf =~ /\G [^\012]* \Z/sxogc) {
-									if (length($buf) - $ixx > $self->{max_header_size}) {
-										$self->badconn($fh,\substr($buf, pos($buf), $ixx), "Header overflow at offset ".$pos."+".(length($buf)-$pos));
-										return $self->drop($id, "Too big headers from $rhost for request <".substr($buf, $ixx, 32)."...>");
+									if ($ixx > 0) {
+										$pos = $bpos - $ixx;
+										$buf = substr($buf,$ixx);
+										$ixx = 0;
 									}
-									#warn "Need more";
-									return pos($buf) = $bpos; # need more data
+									elsif ( length($buf) >= $self->{max_header_size} ) {
+										$self->{active_requests}--;
+										return $reply_error->(413);
+									}
+									warn "Need more data" if DEBUG;
+									return; # need more
 								}
 								else {
 									my ($line) = $buf =~ /\G([^\015\012]++)(?:\015?\012|\Z)/sxogc;
 									$self->{active_requests}--;
-									$self->badconn($fh,\$line, "Bad header for <$method $uri>+{@{[ %h ]}}");
-									my $content = 'Bad request headers';
-									my $str = "HTTP/1.1 400 Bad Request${LF}Connection:close${LF}Content-Type:text/plain${LF}Content-Length:".length($content)."${LF}${LF}".$content;
-									$write->(\$str);
-									$write->(\undef);
-									return;
+									# $self->drop($id, "Bad header line: '$line'"); # TBD
+									return $reply_error->(400);
 								}
 							}
 							
@@ -412,32 +480,41 @@ sub incoming {
 							$pos = pos($buf);
 							
 							$self->{total_requests}++;
-
-							if ( $method eq "GET" and $uri =~ m{^/favicon\.ico( \Z | \? )}sox and $self->{ico}) {
-								$self->{active_requests}--;
+							
+							if ( $self->{ico} and $method eq "GET" and $uri =~ m{^/favicon\.ico( \Z | \? )}sox ) {
 								$write->(\$self->{ico});
 								$write->(\undef) if lc $h{connecton} =~ /^close\b/;
+								$self->{active_requests}--;
 								$ixx = $pos + $h{'content-length'};
-							# } elsif ( $method eq "GET" and $uri =~ m{^/ping( \Z | \? )}sox) {
-							# 	my ( $header_str, $content ) = ref $self->{ping_sub} eq 'CODE' ? $self->{ping_sub}->() : ('200 OK', 'Pong');
-							# 	my $str = "HTTP/1.1 $header_str${LF}Connection:close${LF}Content-Type:text/plain${LF}Content-Length:".length($content)."${LF}${LF}".$content;
-							# 	$write->(\$str);
-							# 	$write->(\undef) if lc $h{connecton} =~ /^close\b/;
-							# 	$self->{active_requests}--;
-							# 	$ixx = $pos + $h{'content-length'};
-							} else {
+							}
+							elsif ( $method eq 'PING' ) {
+								my ( $header_str, $content ) = ref $self->{ping_sub} eq 'CODE' ? $self->{ping_sub}->() : ('200 OK', 'Pong '.time()."\n");
+								my $str = "HTTP/1.1 $header_str${LF}Connection:close${LF}Content-Type:text/plain${LF}Content-Length:".length($content)."${LF}${LF}".$content;
+								$write->(\$str);
+								$write->(\undef);
+								$self->{active_requests}--;
+								$ixx = $pos + $h{'content-length'};
+							}
+							elsif ( $self->{ping} and $method eq "GET" and $uri =~ m{^/ping( \Z | \? )}sox ) {
+								my ( $header_str, $content ) = ref $self->{ping_sub} eq 'CODE' ? $self->{ping_sub}->() : ('200 OK', 'Pong');
+								my $str = "HTTP/1.1 $header_str${LF}Connection:close${LF}Content-Type:text/plain${LF}Content-Length:".length($content)."${LF}${LF}".$content;
+								$write->(\$str);
+								$write->(\undef) if lc $h{connecton} =~ /^close\b/;
+								$self->{active_requests}--;
+								$ixx = $pos + $h{'content-length'};
+							}
+							else {
 								#warn "Create request object";
-								#$req = AnyEvent::HTTP::Server::Req->new(
-								#	method  => $method,
-								#	uri     => $uri,
-								#	headers => \%h,
-								#	write   => $write,
-								#	guard   => guard { $self->{active_requests}--; },
-								#);
-								#my @rv = $self->{cb}->( $req );
-
-								my @rv = $self->{cb}->( $req = bless [ $method, $uri, \%h, $write, undef,undef,undef, \$self->{active_requests}, $self, scalar gettimeofday() ], 'AnyEvent::HTTP::Server::Req' );
-								weaken( $req->[8] );
+								$req = $self->{request}->new(
+									method   => $method,
+									uri      => $uri,
+									headers  => \%h,
+									writer   => $write,
+									reqcount => \$self->{active_requests},
+									server   => $self,
+									version  => $version,
+								);
+								my @rv = $self->{cb}->($req);
 								#my @rv = $self->{cb}->( $req = bless [ $method, $uri, \%h, $write ], 'AnyEvent::HTTP::Server::Req' );
 								if (@rv) {
 									if (ref $rv[0] eq 'CODE') {
@@ -532,14 +609,8 @@ sub incoming {
 													#warn "call for part $hd{name} ($last)";
 													$cb->( $last && $idx == -1 ? 1 : 0,$part,\%hd );
 												}
-												#warn "just return";
-												#if ($last) {
-													#warn "leave with $body";
-												#}
 											};
 										}
-#										elsif ( $h{'content-type'} =~ m{^application/x-www-form-urlencoded(?:\Z|\s*;)}i and exists $rv[0]{form} ) {
-
 										elsif (  exists $rv[0]{form} ) {
 											my $body = '';
 											$r{on_body} = sub {
@@ -568,7 +639,7 @@ sub incoming {
 										);
 										$h->{rbuf} = substr($buf,$pos);
 										#warn "creating handle ".Dumper $h->{rbuf};
-										$req->[3] = sub {
+										$req->writer(sub {
 											my $rbuf = shift;
 											if (defined $$rbuf) {
 												if ($h) {
@@ -583,17 +654,20 @@ sub incoming {
 													$h->on_drain(sub {
 														$h->destroy;
 														undef $h;
-														$self->drop($id) if $self;
 													});
 													undef $h;
 												}
-												else {
-													$self->drop($id) if $self;
-												}
 											}
-										};
-										weaken($req->[11] = $h);
+										});
+										$req->handle($h);
 										$rv[1]->($h);
+										$h->{__cnn_drop_guard} = guard {
+											# use postpone to unroll destruction loop
+											# waiting for request to decrement active_resuests
+											AE::postpone {
+												$self->drop($id) if $self;
+											};
+										};
 										weaken($req);
 										%r = ( );
 										return;
@@ -714,7 +788,6 @@ sub ws_close {
 	for (values %{ $self->{wss} }) {
 		$_ && $_->close();
 	}
-	warn "$self->{active_requests} / $self->{active_connections}";
 }
 
 sub graceful {
@@ -722,9 +795,17 @@ sub graceful {
 	my $cb = pop;
 	delete $self->{aws};
 	close $_ for values %{ $self->{fhs} };
-	if ($self->{active_requests} == 0 or $self->{active_connections} == 0) {
+
+	warn "Graceful shutdown: req=$self->{active_requests} / cnn=$self->{active_connections} / wss=@{[ 0+keys %{ $self->{wss} } ]}\n";# if DEBUG or $self->{debug};
+	
+	if (
+		$self->{active_requests} == 0
+		# and $self->{active_connections} == 0
+		and 0+keys %{ $self->{wss} } == 0
+	) {
 		$cb->();
-	} else {
+	}
+	else {
 		$self->{graceful} = $cb;
 		$self->ws_close();
 	}
@@ -733,47 +814,6 @@ sub graceful {
 
 1; # End of AnyEvent::HTTP::Server
 __END__
-
-sub http_server($$&) {
-	my ($lhost,$lport,$reqcb) = @_;
-	
-	# TBD
-	
-	return $self;
-}
-
-sub __old_stop {
-	my ($self,$cb) = @_;
-	delete $self->{aw};
-	close $self->{socket};
-	if (%{$self->{con}}) {
-		$log->debugf("Server have %d active connectinos while stopping...", 0+keys %{$self->{con}});
-		my $cv = &AE::cv( $cb );
-		$cv->begin;
-		for my $key ( keys %{$self->{con}} ) {
-			my $con = $self->{con}{$key};
-			$log->debug("$key: connection from $con->{host}:$con->{port}: $con->{state}");
-			if ($con->{state} eq 'idle' or $con->{state} eq 'closed') {
-				$con->close;
-				delete $self->{con}{$key};
-				use Devel::FindRef;
-				warn "closed <$con> ".Devel::FindRef::track $con;
-			} else {
-				$cv->begin;
-				$con->{close} = sub {
-					$log->debug("Connection $con->{host}:$con->{port} was closed");
-					$cv->end;
-				};
-			}
-		}
-		if (%{$self->{con}}) {
-			$log->debug("Still have @{[ 0+keys %{$self->{con}} ]}");
-		}
-		$cv->end;
-	} else {
-		$cb->();
-	}
-}
 
 =head1 SYNOPSIS
 

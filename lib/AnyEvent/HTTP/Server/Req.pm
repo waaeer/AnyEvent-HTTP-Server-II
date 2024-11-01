@@ -1,4 +1,4 @@
-package AnyEvent::HTTP::Server::Form;
+package AnyEvent::HTTP::Server::Req;
 
 =head1 NAME
 
@@ -10,9 +10,6 @@ Version 1.97
 
 =cut
 
-our $VERSION = '1.97';
-
-package AnyEvent::HTTP::Server::Req;
 {
 package #hide
 	aehts::sv;
@@ -27,17 +24,34 @@ use overload
 	fallback => 1;
 }
 
+use AnyEvent::HTTP::Server;
 use AnyEvent::HTTP::Server::Kit;
 use AnyEvent::HTTP::Server::WS;
-use Time::HiRes qw/gettimeofday/;
+use Carp ();
+
+use HTTP::Easy::Cookies;
+use POSIX qw(strftime);
+
 use MIME::Base64 qw(encode_base64);
 use Scalar::Util qw(weaken);
-use Digest::SHA 'sha1';
 
+BEGIN {
+	if(eval{ require Digest::SHA1 }) {
+		Digest::SHA1->import('sha1');
+	} elsif(eval { require Digest::SHA }) {
+		Digest::SHA->import('sha1');
+	} else {
+		die 'need Digest::SHA1 or Digest::SHA';
+	}
+}
+	our $Server = 'AEHTS/'.$AnyEvent::HTTP::Server::VERSION;
 	our @hdr = map { lc $_ }
 	our @hdrn  = qw(
 		Access-Control-Allow-Credentials Access-Control-Allow-Origin Access-Control-Allow-Headers
-		Upgrade Connection Content-Type WebSocket-Origin WebSocket-Location Sec-WebSocket-Origin Sec-Websocket-Location Sec-WebSocket-Key Sec-WebSocket-Accept Sec-WebSocket-Protocol DataServiceVersion);
+		Upgrade Connection Content-Type Content-Length WebSocket-Origin WebSocket-Location Sec-WebSocket-Origin Sec-Websocket-Location Sec-WebSocket-Key Sec-WebSocket-Accept Sec-WebSocket-Protocol DataServiceVersion
+		Server
+		X-Req-Id
+	);
 	our %hdr; @hdr{@hdr} = @hdrn;
 	our %hdri; @hdri{ @hdr } = 0..$#hdr;
 	our $LF = "\015\012";
@@ -69,28 +83,92 @@ use Digest::SHA 'sha1';
 			HANDLE    => 11,
 			ATTRS     => 12,
 		};
-		
-		sub connection { $_[0][2]{connection} =~ /^([^;]+)/ && lc( $1 ) }
-		
-		sub method  { $_[0][0] }
-		sub full_uri { 'http://' . $_[0][2]{host} . $_[0][1] }
-		sub uri     { $_[0][1] }
-		sub headers { $_[0][2] }
-		sub attrs   { $_[0][ATTRS] //= {} }
-		sub server  { $_[0][SERVER] }
 
-		sub replied {
-			my $r = shift;
-			if (@_) {
-				$r->attrs->{replied} = shift;
-			}
-			else {
-				$r->attrs->{replied};
-			}
+		our %WARNED;
+		use overload '@{}' => sub {
+			my $self = shift;
+			my $caller = join ":", (caller)[1,2];
+			Carp::carp "Usage of ".ref($self)." as an ARRAYREF outside AEHTS is strictly awry (at $caller)"
+				unless $WARNED{$caller}++;
+			$self->{'@'} //= do {
+				my $compat = [
+					$self->method,
+					$self->uri,
+					$self->headers,
+					undef, # $self->writer,
+					undef, # $self->chunked,
+					$self->params,
+					$self->query,
+					undef, # $self->reqcount,
+					$self->server,
+					$self->reqtime,
+					undef,
+					$self->handle,
+					$self->attrs,
+				];
+				# $compat->[ATTRS] = $self->attrs;
+				# $compat->[HEADERS] = $self->headers;
+				# $compat->[TIME] = $self->reqtime;
+				# $compat->[HANDLE] = $self->handle;
+				$compat;
+			};
+			return $self->{'@'};
+		}, fallback => 1;
+
+		use Class::XSAccessor
+			# constructor => 'new',
+			accessors => [qw(
+				method
+				uri
+				headers
+				server
+
+				reqtime
+				writer handle
+			)],
+			getters => [qw(
+				path query params version
+			)],
+		;
+
+		sub new {
+			my $class = shift;
+			my %args = (
+				@_,
+				reqtime => AE::now(),
+			);
+			@args{qw(path query)} =
+				$args{uri} =~ m{ ^
+					(?:
+						(?:(?:(?:[a-z]+):|)//|)
+						(?:[^/]+)
+					|)
+					(/[^?]*)
+					(?:
+						\? (.+|)
+						|
+					)
+				$ }xso
+			;
+			$args{params} = +{
+				map {
+					my ($k,$v) = split /=/,$_,2;
+					+( url_unescape($k) => url_unescape($v) )
+				} split /&/, $args{query}
+			};
+			return bless \%args, $class;
+		}
+
+		sub connection {
+			$_[0]{headers}{connection} =~ /^([^;]+)/ && lc( $1 ) ||
+			( $_[0]{version} >= 1.1 ? 'keep-alive' : 'close' )
 		}
 		
+		sub full_uri { 'http://' . $_[0]{headers}{host} . $_[0]{uri} }
+		sub attrs   { $_[0]{_} //= {} }
+		
 		sub url_unescape($) {
-			# return undef unless defined $_[0];
+			return undef unless defined $_[0];
 			my $string = shift;
 			$string =~ s/\+/ /sg;
 			#return $string if index($string, '%') == -1;
@@ -119,45 +197,14 @@ use Digest::SHA 'sha1';
 		}
 		
 		sub uri_parse {
-			$_[0][5] = [
-				$_[0][1] =~ m{ ^
-					(?:
-						(?:(?:([a-z]+):|)//|)
-						([^/]+)
-					|)
-					(/[^?]*)
-					(?:
-						\? (.+|)
-						|
-					)
-				$ }xso
-			];
-			# $_[0][5][2] = url_unescape( $_[0][5][2] );
-			$_[0][6] = +{ map { my ($k,$v) = split /=/,$_,2; +( url_unescape($k) => url_unescape($v) ) } split /&/, $_[0][5][3] };
-		}
-		
-		
-		sub path    {
-			$_[0][5] or $_[0]->uri_parse;
-			$_[0][5][2];
-		}
-		
-		sub query    {
-			$_[0][5] or $_[0]->uri_parse;
-			$_[0][5][3];
-		}
-		
-		sub params {
-			$_[0][6] or $_[0]->uri_parse;
-			$_[0][6];
+			Carp::carp "Use of uri_parse is deprecated";
 		}
 		
 		sub param {
-			$_[0][6] or $_[0]->uri_parse;
 			if ($_[1]) {
-				return $_[0][6]{$_[1]};
+				return $_[0]{params}{$_[1]};
 			} else {
-				return keys %{ $_[0][6] };
+				return keys %{ $_[0]{params} };
 			}
 		}
 		our $CALLDEPTH = 1;
@@ -207,22 +254,15 @@ use Digest::SHA 'sha1';
 		sub sendfile {
 			my $self = shift;
 			my ( $code,$file,%args ) = @_;
-			$code ||=200;
 
-			if ($self->replied) {
-				warn "Double reply $code from ".join(":", (caller $CALLDEPTH)[1,2])." prev was from ".$self->replied."\n";
-				exit 255 if $self->server->{exit_on_double_reply};
-				return;
-			}
-			$self->replied(join ":", (caller $CALLDEPTH)[1,2]);
-
+			$code ||= 200;
 			my $reply = "HTTP/1.0 $code $http{$code}$LF";
 			my $size = -s $file or $! and return warn "Can't sendfile `$file': $!";
 			open my $f, '<:raw',$file or return  warn "Can't open file `$file': $!";
 			
 			my @good;my @bad;
 			my $h = {
-				server           => 'aehts-'.$AnyEvent::HTTP::Server::VERSION,
+				server           => $Server,
 				%{ $args{headers} || {} },
 				'connection' => ( $args{headers} && $args{headers}{connection} ) ? $args{headers}{connection} : $self->connection,
 				'content-length' => $size,
@@ -236,22 +276,26 @@ use Digest::SHA 'sha1';
 				$h->{'content-type'} = 'application/octet-stream';
 			}
 			for (keys %$h) {
-				if (exists $hdr{lc $_}) { $good[ $hdri{lc $_} ] = $hdr{ lc $_ }.": ".$h->{$_}.$LF; }
-				else { push @bad, "\u\L$_\E: ".$h->{$_}.$LF; }
+				if (exists $hdr{lc $_}) { $good[ $hdri{lc $_} ] = $hdr{ lc $_ }.": ".$h->{$_}; }
+				else { push @bad, "\u\L$_\E: ".$h->{$_}; }
 			}
-			defined() and $reply .= $_ for @good,@bad;
+			for (@good,@bad) {
+				if (defined()) {
+					s/[\r\n]+/ /g;
+					$reply .= $_ . $LF;
+				}
+			}
 			$reply .= $LF;
-			if( $self->[3] ) {
-				$self->[3]->( \$reply );
+			if( $self->{writer} ) {
+				$self->{writer}->( \$reply );
 				while ($size > 0) {
 					my $l = sysread($f,my $buf,4096);
 					defined $l or last;
 					$size -= $l;
-					$self->[3]->( \$buf );
+					$self->{writer}->( \$buf );
 				}
-				$self->[3]->( \undef ) if $h->{connection} eq 'close' or $self->[SERVER]{graceful};
-				delete $self->[3];
-				${ $self->[REQCOUNT] }--;
+				$self->{writer}->( \undef ) if $h->{connection} eq 'close' or $self->server->{graceful};
+				delete $self->{writer};
 			}
 		}
 		
@@ -268,25 +312,14 @@ use Digest::SHA 'sha1';
 			my $self = shift;
 			#return $self->headers(@_) if @_ % 2;
 			my ($code,$content,%args) = @_;
-			$code ||=200;
-			#if (ref $content) {
-			#	if (ref $content eq 'HASH' and $content->{sendfile}) {
-			#		$content->{size} = -s $content->{sendfile};
-			#	}
-			#	else {
-			#		croak "Unknown type of content: $content";
-			#	}
-			#	
-			#} else {
-				utf8::encode $content if utf8::is_utf8 $content;
-			#}
-			my $reply = "HTTP/1.0 $code $http{$code}$LF";
+			$code ||= 200;
+			$content = '' unless defined $content;
+			utf8::encode $content if utf8::is_utf8 $content;
+			my $reply = "HTTP/$self->{version} $code $http{$code}$LF";
 			my @good;my @bad;
 			my $h = {
-				server           => 'aehts-'.$AnyEvent::HTTP::Server::VERSION,
-				#'content-type+charset' => 'UTF-8';
+				server           => $Server,
 				%{ $args{headers} || {} },
-				#'connection' => 'close',
 				'connection' => ( $args{headers} && $args{headers}{connection} ) ? $args{headers}{connection} : $self->connection,
 			};
 			if ($self->method ne 'HEAD') {
@@ -310,6 +343,13 @@ use Digest::SHA 'sha1';
 				}
 				$content = '';
 			}
+
+			# https://www.rfc-editor.org/rfc/rfc7230#section-3.3.2
+			if ($code == 204 or $code == 304 or $code < 200) {
+				delete $h->{'content-length'};
+				$content = '';
+			}
+
 			if (exists $h->{'content-type'}) {
 				if( $h->{'content-type'} !~ m{[^;]+;\s*charset\s*=}
 				and $h->{'content-type'} =~ m{(?:^(?:text/|application/(?:json|(?:x-)?javascript))|\+(?:json|xml)\b)}i) {
@@ -319,28 +359,63 @@ use Digest::SHA 'sha1';
 				$h->{'content-type'} = 'text/html; charset=utf-8';
 			}
 			my $nh = delete $h->{NotHandled};
-			for (keys %$h) {
-				if (exists $hdr{lc $_}) { $good[ $hdri{lc $_} ] = $hdr{ lc $_ }.": ".$h->{$_}.$LF; }
-				else { push @bad, "\u\L$_\E: ".$h->{$_}.$LF; }
+
+			# set multiple cookies
+			if(ref $h->{'set-cookie'} eq 'ARRAY') {
+				my $cookies = delete $h->{'set-cookie'};
+
+				#set-cookie is not in @hdr
+				push(@bad, "Set-Cookie: ".$_.$LF) for(@{$cookies});
 			}
-			defined() and $reply .= $_ for @good,@bad;
+
+			for (keys %$h) {
+				if (exists $hdr{lc $_}) { $good[ $hdri{lc $_} ] = $hdr{ lc $_ }.": ".$h->{$_}; }
+				else {
+					if (lc $_ eq 'set-cookie' ) {
+						my $cookies = HTTP::Easy::Cookies->decode($h->{$_});
+						for my $d (keys %$cookies) {
+							next if $d eq 'version';
+							for my $p (keys %{$cookies->{$d}}) {
+								for my $n (keys %{$cookies->{$d}{$p}}) {
+									my $o = $cookies->{$d}{$p}{$n};
+									my @c = $n . '=' . $o->{value};
+									push @c, "expires=" . strftime('%a, %d %b %Y %T GMT', gmtime($o->{expires})) if $o->{expires};
+									push @c, "domain=". $d;
+									push @c, "path=" . $p;
+									push @c, "Secure"  if $o->{secure};
+									push @c, "HttpOnly"  if $o->{httponly};
+									push @c, "SameSite=" . $o->{samesite} if $o->{samesite};
+									push @bad, "\u\Lset-cookie\E: ". join('; ',@c);
+								}
+							}
+						}
+					} else {
+						push @bad, "\u\L$_\E: ".$h->{$_};
+					}
+				}
+			}
+			for (@good,@bad) {
+				if (defined()) {
+					s/[\r\n]+/ /g;
+					$reply .= $_ . $LF;
+				}
+			}
 			# 2 is size of LF
 			$self->attrs->{head_size} = length($reply) + 2;
 			$self->attrs->{body_size} = length $content;
 			$reply .= $LF.$content;
 			#if (!ref $content) { $reply .= $content }
-			if( $self->[3] ) {
-				$self->[3]->( \$reply );
-				$self->[3]->( \undef ) if $h->{connection} eq 'close' or $self->[SERVER]{graceful};
-				delete $self->[3];
-				${ $self->[REQCOUNT] }--;
+			if( $self->{writer} ) {
+				$self->{writer}->( \$reply );
+				$self->{writer}->( \undef ) if $h->{connection} eq 'close' or $self->server->{graceful};
+				delete $self->{writer};
 			}
-			if( $self->[8] && $self->[8]->{on_reply} ) {
-				$h->{ResponseTime} = gettimeofday() - $self->[9];
+			if( $self->server && $self->server->{on_reply} ) {
+				$h->{ResponseTime} = AE::now() - $self->reqtime;
 				$h->{Status} = $code;
 				$h->{NotHandled} = $nh if $nh;
 				#eval {
-					$self->[8]->{on_reply}->(
+					$self->server->{on_reply}->(
 						$self,
 						$h,
 					);
@@ -349,16 +424,9 @@ use Digest::SHA 'sha1';
 				#};
 			};
 
-			if ($self->replied) {
-				warn "Double reply $code from ".join(":", (caller $CALLDEPTH)[1,2])." prev was from ".$self->replied."\n";
-				exit 255 if $self->server->{exit_on_double_reply};
-				return;
-			}
-			$self->replied(join ":", (caller $CALLDEPTH)[1,2]);
-
-			if( $self->[8] && $self->[8]->{stat_cb} ) {
+			if( $self->server && $self->server->{stat_cb} ) {
 				eval {
-					$self->[8]->{stat_cb}->($self->path, $self->method, gettimeofday() - $self->[9]);
+					$self->server->{stat_cb}->($self->path, $self->method, AE::now() - $self->reqtime);
 				1} or do {
 					warn "stat_cb died with $@";
 				}
@@ -390,20 +458,24 @@ use Digest::SHA 'sha1';
 					#'sec-websocket-protocol' => 'chat',
 				} );
 				
-				${ $self->[REQCOUNT] }--;
+				${ $self->{reqcount} }--;
+				$self->{reqcount} = undef;
 				
 				my $create_ws = sub {
 					my $h = shift;
 					my $ws = AnyEvent::HTTP::Server::WS->new(
-						%args, h => $h,
+						%args,
+						h => $h,
+						server => $self->server,
 					);
-					weaken( $self->[SERVER]{wss}{ 0+$ws } = $ws );
-					@$self = ();
+					weaken( $self->server->{wss}{ 0+$ws } = $ws );
+					
+					%$self = ();
 					$cb->($ws);
 				};
 				
-				if ( $self->[HANDLE] ) {
-					$create_ws->($self->[HANDLE]);
+				if ( $self->handle ) {
+					$create_ws->($self->handle);
 					return
 				}
 				else {
@@ -420,7 +492,7 @@ use Digest::SHA 'sha1';
 		sub send_100_continue {
 			my ($self,$code,%args) = @_;
 			my $reply = "HTTP/1.1 100 $http{100}$LF$LF";
-			$self->[3]->( \$reply );
+			$self->{writer}->( \$reply );
 		}
 
 		sub send_headers {
@@ -444,9 +516,9 @@ use Digest::SHA 'sha1';
 			};
 			if (!exists $h->{'content-length'} and !exists $h->{upgrade}) {
 				$h->{'transfer-encoding'} = 'chunked';
-				$self->[4]= 1;
+				$self->{chunked}= 1;
 			} else {
-				$self->[4]= 0;
+				$self->{chunked}= 0;
 			}
 			for (keys %$h) {
 				if (exists $hdr{lc $_}) { $good[ $hdri{lc $_} ] = $hdr{ lc $_ }.": ".$h->{$_}.$LF; }
@@ -459,38 +531,43 @@ use Digest::SHA 'sha1';
 			$self->attrs->{head_size} = length $reply;
 			$self->attrs->{body_size} = 0;
 			#warn "send headers: $reply";
-			$self->[3]->( \$reply );
-			if (!$self->[4]) {
+			$self->{writer}->( \$reply );
+			if (!$self->{chunked}) {
 				if ($args{clearance}) {
-					$self->[3] = undef;
+					$self->{writer} = undef;
 				}
 			}
 		}
 		
 		sub body {
 			my $self = shift;
-			$self->[4] or die "Need to be chunked reply";
+			$self->{chunked} or die "Need to be chunked reply";
 			my $content = shift;
 			utf8::encode $content if utf8::is_utf8 $content;
 			$self->attrs->{body_size} += length $content;
 			my $length = sprintf "%x", length $content;
 			#warn "send body part $length / ".length($content)."\n";
-			$self->[3]->( \("$length$LF$content$LF") );
+			$self->{writer}->( \("$length$LF$content$LF") );
 		}
 		
 		sub finish {
 			my $self = shift;
-			if ($self->[4]) {
-				#warn "send body end (".$self->connection.")\n";
-				if( $self->[3] ) {
-					$self->[3]->( \("0$LF$LF")  );
-					$self->[3]->(\undef) if $self->connection eq 'close' or $self->[SERVER]{graceful};
-					delete $self->[3];
+			if ($self->{chunked}) {
+				# warn "send body end (".$self->connection.")\n";
+				if( $self->{writer} ) {
+					$self->{writer}->( \("0$LF$LF")  );
+					$self->{writer}->(\undef) if $self->connection eq 'close' or $self->server->{graceful};
+					delete $self->{writer};
 				}
-				undef $self->[4];
+				undef $self->{chunked};
 			}
-			elsif(defined $self->[4]) {
-				undef $self->[4];
+			elsif(defined $self->{chunked}) {
+				# warn "sent body with non-chunked (wr=$self->{writer}) (".$self->connection.")\n";
+				if( $self->{writer} ) {
+					$self->{writer}->(\undef) if $self->connection eq 'close' or $self->server->{graceful};
+					delete $self->{writer};
+				}
+				undef $self->{chunked};
 			}
 			else {
 				die "Need to be chunked reply";
@@ -498,9 +575,9 @@ use Digest::SHA 'sha1';
 			${ $self->[REQCOUNT] }--;
 			if ( $self->attrs->{sent_headers} ) {
 				my $h = delete $self->attrs->{sent_headers};
-				if( $self->[8] && $self->[8]->{on_reply} ) {
-					$h->{ResponseTime} = gettimeofday() - $self->[9];
-					$self->[8]->{on_reply}->(
+				if( $self->server && $self->server->{on_reply} ) {
+					$h->{ResponseTime} = AE::now() - $self->reqtime;
+					$self->server->{on_reply}->(
 						$self,
 						$h,
 					);
@@ -510,16 +587,15 @@ use Digest::SHA 'sha1';
 
 		sub abort {
 			my $self = shift;
-			if( $self->[4] ) {
-				if( $self->[3] ) {
-					$self->[3]->( \("1$LF"));
-					$self->[3]->( \undef);
-					delete $self->[3];
+			if( $self->{chunked} ) {
+				if( $self->{writer} ) {
+					$self->{writer}->( \("1$LF"));
+					$self->{writer}->( \undef);
+					delete $self->{writer};
 				}
-				undef $self->[4];
 			}
-			elsif (defined $self->[4]) {
-				undef $self->[4];
+			elsif (defined $self->{chunked}) {
+				undef $self->{chunked};
 			}
 			else {
 				die "Need to be chunked reply";
@@ -527,36 +603,39 @@ use Digest::SHA 'sha1';
 			${ $self->[REQCOUNT] }--;
 			if ( $self->attrs->{sent_headers} ) {
 				my $h = delete $self->attrs->{sent_headers};
-				if( $self->[8] && $self->[8]->{on_reply} ) {
-					$h->{ResponseTime} = gettimeofday() - $self->[9];
+				if( $self->server && $self->server->{on_reply} ) {
+					$h->{ResponseTime} = AE::now() - $self->reqtime;
 					$h->{SentStatus} = $h->{Status};
 					$h->{Status} = "590";
-					$self->[8]->{on_reply}->(
+					$self->server->{on_reply}->(
 						$self,
 						$h,
 					);
 				};
 			}
 		}
-		
+
+		sub CLEAR {}
 		sub DESTROY {
 			my $self = shift;
+			$self->CLEAR();
 			my $caller = "@{[ (caller)[1,2] ]}";
-			#warn "Destroy req $self->[0] $self->[1] by $caller";
-			if( $self->[3] ) {
+			# warn "Destroy req $self->{method} $self->{uri} by $caller";
+			if( $self->{writer} ) {
 				local $@;
 				eval {
-					if ($self->[4]) {
+					if ($self->{chunked}) {
 						$self->abort();
 					} else {
-						if( $self->[8] && $self->[8]->{on_not_handled} ) {
-							$self->[8]->{on_not_handled}->($self, $caller);
+						if( $self->server && $self->server->{on_not_handled} ) {
+							$self->server->{on_not_handled}->($self, $caller);
 						}
-						if ($self->[3]) {
-							$self->reply( 500, "Request not handled\n$self->[0] $self->[1]\n", headers => { 'content-type' => 'text/plain', NotHandled => 1 } );
+						if ($self->{writer}) {
+							$self->reply( 500, "Request not handled\n$self->{method} $self->{uri}\n", headers => { 'content-type' => 'text/plain', NotHandled => 1 } );
 						}
 					}
 				1} or do {
+					warn;
 					if ($EV::DIED) {
 						@_ = ();
 						goto &$EV::DIED;
@@ -565,11 +644,14 @@ use Digest::SHA 'sha1';
 					}
 				};
 			}
-			elsif (defined $self->[4]) {
-				warn "[E] finish or abort was not called for ".( $self->[4] ? "chunked" : "partial" )." response";
+			elsif (defined $self->{chunked}) {
+				warn "[E] finish or abort was not called for ".( $self->{chunked} ? "chunked" : "partial" )." response";
 				$self->abort;
 			}
-			@$self = ();
+			if ($self->{reqcount}) {
+				${ $self->{reqcount} }--;
+			}
+			%$self = ();
 		}
 
 
