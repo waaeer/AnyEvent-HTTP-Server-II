@@ -9,6 +9,6 @@ Homepage: https://github.com/Mons/AnyEvent-HTTP-Server-II
 
 Package: libanyevent-http-server-ii-perl
 Architecture: all
-Depends: ${misc:Depends}, ${perl:Depends}, libev-perl, libanyevent-perl, libdigest-sha-perl, libjson-xs-perl
+Depends: ${misc:Depends}, ${perl:Depends}, libev-perl, libanyevent-perl, libdigest-sha-perl, libjson-xs-perl, libhttp-easy-perl
 Description: Asynchronous event driven perl HTTP server.
 

@@ -225,12 +225,6 @@ sub noaccept {
 	delete $self->{aws};
 }
 
-sub peer_info {
-	my $fh = shift;
-	my ($port, $host) = AnyEvent::Socket::unpack_sockaddr getpeername($fh);
-	return AnyEvent::Socket::format_address($host).':'.$port;
-}
-
 sub drop {
 	my ($self,$id,$err) = @_;
 	$err =~ s/\015//sg;
@@ -261,34 +255,18 @@ sub req_wbuf_len {
 	return length ${ $self->{ $req->headers->{INTERNAL_REQUEST_ID} }{wbuf} };
 }
 
-sub badconn {
-	my ($self,$fh,$rbuf,$msg) = @_;
-	my $outbuf = (length $$rbuf > 2048) ?
-		substr($$rbuf,0,2045).'...' :
-		"$$rbuf";
-	$outbuf =~ s{(\p{C}|\\)}{ sprintf "\\%03o", ord $1 }sge;
-	my $remote = peer_info($fh);
-	my $fileno = fileno $fh;
-	warn "$msg from $remote (fd:$fileno) <$outbuf>\n";
-}
-
 sub incoming {
 	weaken( my $self = shift );
-	# warn "incoming @_";
+	#warn "incoming @_";
 	$self->{total_connections}++;
 		my ($fh,$rhost,$rport) = @_;
 		my $id = ++$self->{seq}; #refaddr $fh;
-
 		
 		my %r = ( fh => $fh, id => $id );
 		my $buf;
 		
 		$self->{ $id } = \%r;
 		$self->{active_connections}++;
-
-	warn sprintf("Accepted connection $id (fd:%s) from %s ($self->{active_connections}/$self->{total_connections}; $self->{active_requests}/$self->{total_requests})\n", fileno($_[0]),
-		$self->{want_peer} ? "$_[1]:$_[2]" : peer_info($_[0])
-	) if $self->{debug_conn};
 		
 		my $write = sub {
 			$self and exists $self->{$id} or return;
@@ -349,11 +327,10 @@ sub incoming {
 		
 		my $ixx = 0;
 		$r{rw} = AE::io $fh, 0, sub {
-			# warn "rw.io.$id (".(fileno $fh).") seq:$seq (ok:".($self ? 1:0).':'.(( $self && exists $self->{$id}) ? 1 : 0).")";# if DEBUG;
+			#warn "rw.io.$id (".(fileno $fh).") seq:$seq (ok:".($self ? 1:0).':'.(( $self && exists $self->{$id}) ? 1 : 0).")" if DEBUG;
 			$self and exists $self->{$id} or return;
 			while ( $self and ( $len = sysread( $fh, $buf, $self->{read_size}-length $buf, length $buf ) ) ) {
 				if ($state == 0) {
-						AGAIN:
 						if (( my $i = index($buf,"\012", $ixx) ) > -1) {
 							if (substr($buf, $ixx, $i - $ixx) =~ /^(\S++) \040 (\S++) \040 HTTP\/(\d++\.\d++)\015?$/xso) {
 								$method  = $1;
@@ -389,7 +366,6 @@ sub incoming {
 							return; # need more
 						}
 				}
-				# warn "rw.io.$id.rd $len ($state) -> $pos";
 				my %h = ( INTERNAL_REQUEST_ID => $id, defined $rhost ? ( Remote => $rhost, RemotePort => $rport ) : () );
 				if ($state == 1) {
 					# headers
@@ -401,17 +377,12 @@ sub incoming {
 								if( $buf =~ /\G ([^:\000-\037\040]++)[\011\040]*+:[\011\040]*+ ([^\012\015;]*+(;)?[^\012\015]*+) \015?\012/sxogc ){
 									$lastkey = lc $1;
 									$h{ $lastkey } = exists $h{ $lastkey } ? $h{ $lastkey }.','.$2: $2;
-									warn "Captured header $lastkey = '$2'";
+									#warn "Captured header $lastkey = '$2'";
 									if ( defined $3 ) {
-										my $v = $2;
-										while ( $v =~ m{ \s* ([^\s=]++)\s*= (?: "((?:[^\\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* ;? }gcxso ) { 
-                                        	$h{ $lastkey . '+' . lc($1) } = ( defined $2 ? do { my $x = $2; $x =~ s{\\(.)}{$1}gs; $x } : $3 )
-										}
-
 										pos(my $v = $2) = $-[3] - $-[2];
 										#warn "scan ';'";
 										$h{ $lastkey . '+' . lc($1) } = ( defined $2 ? do { my $x = $2; $x =~ s{\\(.)}{$1}gs; $x } : $3 )
-											while ( $v =~ m{ \s* ([^\s=]++)\s*= (?: "((?:[^\\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* ;?}gcxso ); # "
+											while ( $v =~ m{ \G ; \s* ([^\s=]++)\s*= (?: "((?:[^\\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* }gcxso ); # "
 										$contstate = 1;
 									} else {
 										$contstate = 0;
@@ -470,6 +441,7 @@ sub incoming {
 								}
 								else {
 									my ($line) = $buf =~ /\G([^\015\012]++)(?:\015?\012|\Z)/sxogc;
+									warn "Drop: bad header line: '$line'";
 									$self->{active_requests}--;
 									# $self->drop($id, "Bad header line: '$line'"); # TBD
 									return $reply_error->(400);
@@ -762,24 +734,11 @@ sub incoming {
 			} # while read
 			return unless $self and exists $self->{$id};
 			if (defined $len) {
-				if (length $buf == MAX_READ_SIZE) {
-					$self->badconn($fh,\$buf,"Can't read (@{[ MAX_READ_SIZE ]}), can't consume");
-					# $! = Errno::EMSGSIZE; # Errno is useless, since not calling drop
-					my $content = 'Non-consumable request';
-					my $str = "HTTP/1.1 400 Bad Request${LF}Connection:close${LF}Content-Type:text/plain${LF}Content-Length:".length($content)."${LF}${LF}".$content;
-					$self->{active_requests}--;
-					$write->(\$str);
-					$write->(\undef);
-					return;
-				}
-				else {
-					# $! = Errno::EPIPE;
-					# This is not an error, just EOF
-				}
+				$! = Errno::EPIPE; # warn "EOF from client ($len)";
 			} else {
 				return if $! == EAGAIN or $! == EINTR or $! == WSAEWOULDBLOCK;
 			}
-			$self->drop($id, $! ? "$!" : ());
+			$self->drop($id, "$!");
 		}; # io
 }
 
@@ -878,8 +837,8 @@ to true, or request processing will be aborted by AnyEvent:HTTP::Server.
 
 One able to process POST requests by returning specially crafted  hash reference from cb 
 parameter coderef ($dispatcher in out example). This hash must contain the B<form> key, 
-holding a code reference. If such key exists, this code reference will be called with two arguments,
-parsed x-www-form-urlencoded POST content and same not parsed.
+holding a code reference. If B<content-encoding> header is 
+B<application/x-www-form-urlencoded>, form callback will be called.
 
   my $post_action = sub {
     my ( $request, $form ) = @_;
@@ -893,12 +852,10 @@ parsed x-www-form-urlencoded POST content and same not parsed.
   my $dispatcher = sub {
     my $request = shift;
 
-    if ( $request->headers->{'content-type'} =~ m{^application/(json|x-www-form-urlencoded)\s*$} ) {
+    if ( $request->headers->{'content-type'} =~ m{^application/x-www-form-urlencoded\s*$} ) {
       return {
         form => sub {
-		  my ($args, $post_content_plain);
-  #         ...
-            $request->reply($status, $content, headers => $headers);
+          $cb->( $request, $post_action);
         },
       };
     } else {
