@@ -377,12 +377,19 @@ sub incoming {
 								if( $buf =~ /\G ([^:\000-\037\040]++)[\011\040]*+:[\011\040]*+ ([^\012\015;]*+(;)?[^\012\015]*+) \015?\012/sxogc ){
 									$lastkey = lc $1;
 									$h{ $lastkey } = exists $h{ $lastkey } ? $h{ $lastkey }.','.$2: $2;
-									#warn "Captured header $lastkey = '$2'";
-									if ( defined $3 ) {
-										pos(my $v = $2) = $-[3] - $-[2];
-										#warn "scan ';'";
-										$h{ $lastkey . '+' . lc($1) } = ( defined $2 ? do { my $x = $2; $x =~ s{\\(.)}{$1}gs; $x } : $3 )
-											while ( $v =~ m{ \G ; \s* ([^\s=]++)\s*= (?: "((?:[^\\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* }gcxso ); # "
+									# warn "UCWAO Captured header $lastkey = '$2' 3='$3'";
+									if ( defined $3 ) { 
+										my $v = $2;
+										while ( $v =~ m{ \s* ([^\s=]++)\s*= (?: "((?:[^\\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* ;? }gcxso ) { 
+											$h{ $lastkey . '+' . lc($1) } = ( defined $2 ? do { my $x = $2; $x =~ s{\\(.)}{$1}gs; $x } : $3 )
+										}
+#										my $v = $2;
+#										#pos(my $v = $2) = $-[3] - $-[2];
+#										warn "UCWAO scan ';' in v=$v";
+#										while ( $v =~ m{ \G ;? \s* ([^\s=]++)\s*= (?: "((?:[^\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* }gcxso ) { #; # "
+#											warn "WAO c=$1 2=$2 3=$3\n";
+#											$h{ $lastkey . '+' . lc($1) } = ( defined $2 ? do { my $x = $2; $x =~ s{\\(.)}{$1}gs; $x } : $3 )
+#										}
 										$contstate = 1;
 									} else {
 										$contstate = 0;
