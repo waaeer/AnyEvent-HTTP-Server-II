@@ -383,15 +383,12 @@ sub incoming {
 										while ( $v =~ m{ \s* ([^\s=]++)\s*= (?: "((?:[^\\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* ;? }gcxso ) { 
 											$h{ $lastkey . '+' . lc($1) } = ( defined $2 ? do { my $x = $2; $x =~ s{\\(.)}{$1}gs; $x } : $3 )
 										}
-#										my $v = $2;
-#										#pos(my $v = $2) = $-[3] - $-[2];
-#										warn "UCWAO scan ';' in v=$v";
-#										while ( $v =~ m{ \G ;? \s* ([^\s=]++)\s*= (?: "((?:[^\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* }gcxso ) { #; # "
-#											warn "WAO c=$1 2=$2 3=$3\n";
-#											$h{ $lastkey . '+' . lc($1) } = ( defined $2 ? do { my $x = $2; $x =~ s{\\(.)}{$1}gs; $x } : $3 )
-#										}
-										$contstate = 1;
+\										$contstate = 1;
 									} else {
+										my $v = $2;
+										if( $v =~ m{ \s* ([^\s=]++)\s*= (?: "((?:[^\\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* ;? }xso ) { 
+											$h{ $lastkey . '+' . lc($1) } = ( defined $2 ? do { my $x = $2; $x =~ s{\\(.)}{$1}gs; $x } : $3 )
+										}
 										$contstate = 0;
 									}
 								}

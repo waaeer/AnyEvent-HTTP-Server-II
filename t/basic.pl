@@ -294,7 +294,6 @@ if ALL;
 test_server {
 	my $s = shift;
 	my $r = shift;
-	warn "COOK".$r->headers->{'cookie'}."\n";
 	return (
 		$r->method eq 'GET' ? 200 : 400,
 		"x=".$r->headers->{'cookie+x'}.",y=".$r->headers->{'cookie+y'},
