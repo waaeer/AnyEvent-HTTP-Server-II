@@ -377,7 +377,7 @@ sub incoming {
 								if( $buf =~ /\G ([^:\000-\037\040]++)[\011\040]*+:[\011\040]*+ ([^\012\015;]*+(;)?[^\012\015]*+) \015?\012/sxogc ){
 									$lastkey = lc $1;
 									$h{ $lastkey } = exists $h{ $lastkey } ? $h{ $lastkey }.','.$2: $2;
-									# warn "UCWAO Captured header $lastkey = '$2' 3='$3'";
+									# warn "Captured header $lastkey = '$2' 3='$3'";
 									if ( defined $3 ) { 
 										my $v = $2;
 										while ( $v =~ m{ \s* ([^\s=]++)\s*= (?: "((?:[^\\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* ;? }gcxso ) { 
