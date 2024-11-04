@@ -378,13 +378,14 @@ sub incoming {
 									$lastkey = lc $1;
 									$h{ $lastkey } = exists $h{ $lastkey } ? $h{ $lastkey }.','.$2: $2;
 									#warn "Captured header $lastkey = '$2'";
+									my $v = $2;
 									if ( defined $3 ) {
-										pos(my $v = $2) = $-[3] - $-[2];
-										#warn "scan ';'";
 										$h{ $lastkey . '+' . lc($1) } = ( defined $2 ? do { my $x = $2; $x =~ s{\\(.)}{$1}gs; $x } : $3 )
-											while ( $v =~ m{ \G ; \s* ([^\s=]++)\s*= (?: "((?:[^\\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* }gcxso ); # "
+											while ( $v =~ m{ \s* ([^\s=]++)\s*= (?: "((?:[^\\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* ;? }gcxso ); # "
 										$contstate = 1;
-									} else {
+									} else {							
+										$h{ $lastkey . '+' . lc($1) } = ( defined $2 ? do { my $x = $2; $x =~ s{\\(.)}{$1}gs; $x } : $3 )
+											if ( $v =~ m{ \s* ([^\s=]++)\s*= (?: "((?:[^\\"]++|\\.){0,4096}+)" | ([^;,\s]++) ) \s* ;? }xso ); # "
 										$contstate = 0;
 									}
 								}

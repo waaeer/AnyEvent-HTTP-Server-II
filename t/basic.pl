@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 
-use Test::More tests => 224;
+use Test::More tests => 244;
 use Data::Dumper;
 use FindBin;
 use lib "$FindBin::Bin/..";
@@ -289,6 +289,23 @@ test_server {
 	return 200, undef;
 }	'200 - with undef body',
 	[["GET /test1 HTTP/1.1\nHost:localhost\nConnection:keep-alive\n\n"], 200, { 'content-length' => 0 }, "" ],
+if ALL;
+
+test_server {
+	my $s = shift;
+	my $r = shift;
+	return (
+		$r->method eq 'GET' ? 200 : 400,
+		"x=".$r->headers->{'cookie+x'}.",y=".$r->headers->{'cookie+y'},
+		headers => {
+		},
+	);
+}	'Cookies parsing',
+	[["GET /test1 HTTP/1.1\nCookie: x=1\n\n"],                          200, {  }, "x=1,y=" ],
+	[["GET /test2 HTTP/1.1\nCookie: x=1;y=2\n\n"],                      200, {  }, "x=1,y=2" ],
+	[["GET /test2 HTTP/1.1\nCookie: x=\"1\";y=2\n\n"],                  200, {  }, "x=1,y=2" ],
+	[["GET /test2 HTTP/1.1\nCookie: x=1;y=\"2\"\n\n"],                  200, {  }, "x=1,y=2" ],
+	[["GET /test2 HTTP/1.1\nCookie: x=\"1\";y=\"2\"\n\n"],              200, {  }, "x=1,y=2" ],
 if ALL;
 
 }
